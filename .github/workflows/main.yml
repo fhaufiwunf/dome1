@@ -1,0 +1,173 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  IMAGE_NAME: devsecops-demo-app
+  APP_URL: http://127.0.0.1:4280
+  N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+
+jobs:
+  build-scan-gate-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep Scan
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --json \
+            --output semgrep-report.json \
+            . || true
+
+      - name: Run Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          ignore-unfixed: true
+          format: json
+          output: trivy-report.json
+          exit-code: '0'
+
+      # Optional: start the app before ZAP. Adjust this section to your app.
+      # If your repository does not have docker-compose.yml, replace this with your own start command.
+      - name: Start app for ZAP scan
+        run: |
+          if [ -f docker-compose.yml ]; then
+            docker compose up -d --build
+          elif [ -f devsecops-demo-app/docker-compose.yml ]; then
+            docker compose -f devsecops-demo-app/docker-compose.yml up -d --build
+          else
+            echo "No docker-compose.yml found. Skipping app start."
+          fi
+
+          echo "Waiting for app at $APP_URL ..."
+          for i in {1..30}; do
+            if curl -sSf "$APP_URL" > /dev/null; then
+              echo "App is running at $APP_URL"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "App is not reachable. ZAP report will be empty."
+          echo '{}' > zap-report.json
+
+      - name: Run ZAP Baseline Scan
+        run: |
+          if [ -s zap-report.json ]; then
+            echo "Using existing empty ZAP report because app was not reachable."
+            exit 0
+          fi
+
+          mkdir -p zap-output
+          chmod 777 zap-output
+          docker run --rm --network host \
+            -v ${{ github.workspace }}/zap-output:/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t "$APP_URL" \
+            -J zap-report.json \
+            -I || true
+
+          cp zap-output/zap-report.json zap-report.json || echo '{}' > zap-report.json
+
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            semgrep-report.json
+            trivy-report.json
+            zap-report.json
+
+      - name: Send Reports to n8n Security Gate
+        id: security_gate
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --slurpfile trivy trivy-report.json \
+            --slurpfile semgrep semgrep-report.json \
+            --slurpfile zap zap-report.json \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit "${{ github.sha }}" \
+            '{
+              metadata: {
+                repo: $repo,
+                branch: $branch,
+                commit: $commit
+              },
+              trivy: $trivy[0],
+              semgrep: $semgrep[0],
+              zap: $zap[0]
+            }' > final-report.json
+
+          curl -fsS --retry 3 --connect-timeout 10 --max-time 180 \
+            -X POST "$N8N_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @final-report.json \
+            -o n8n-response.json
+
+          cat n8n-response.json
+
+          if ! jq -e . n8n-response.json > /dev/null; then
+            echo "n8n did not return valid JSON. Blocking deployment."
+            exit 1
+          fi
+
+          decision=$(jq -r '.pipeline_decision // "BLOCK"' n8n-response.json | tr '[:upper:]' '[:lower:]')
+          risk_score=$(jq -r '.risk_score // 0' n8n-response.json)
+
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "risk_score=$risk_score" >> "$GITHUB_OUTPUT"
+
+      - name: Check Security Gate
+        run: |
+          echo "Security decision: ${{ steps.security_gate.outputs.decision }}"
+          echo "Risk score: ${{ steps.security_gate.outputs.risk_score }}"
+
+          if [ "${{ steps.security_gate.outputs.decision }}" != "allow" ]; then
+            echo "Security gate failed. CD deployment stopped."
+            exit 1
+          fi
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Setup kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} set image deployment/${{ secrets.K8S_DEPLOYMENT }} \
+            ${{ secrets.K8S_CONTAINER }}=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} rollout status deployment/${{ secrets.K8S_DEPLOYMENT }}
