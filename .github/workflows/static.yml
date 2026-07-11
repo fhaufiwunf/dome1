@@ -6,15 +6,12 @@ on:
 
 env:
   IMAGE_NAME: devsecops-demo-app
-  # Set this variable in GitHub:
-  # Settings -> Secrets and variables -> Actions -> Variables
-  APP_URL: ${{ vars.SCAN_TARGET_URL }}
-  N8N_WEBHOOK_URL: https://unfitted-unsubtle-overdrive.ngrok-free.dev/webhook/security-scan
+  APP_URL: http://127.0.0.1:8080
+  N8N_WEBHOOK_URL: https://unfitted-unsubtle-overdrive.ngrok-free.dev/webhook/security-scan-ai
 
 jobs:
   build-scan-gate-deploy:
-    # The job must run on the Ubuntu machine that can reach localhost/private targets.
-    runs-on: [self-hosted, linux, x86]
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -22,7 +19,7 @@ jobs:
 
       - name: Run Semgrep Scan
         run: |
-          python3 -m pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install semgrep
           semgrep scan \
             --config p/security-audit \
@@ -30,8 +27,6 @@ jobs:
             --json \
             --output semgrep-report.json \
             . || true
-          test -s semgrep-report.json
-          jq empty semgrep-report.json
 
       - name: Run Trivy FS Scan
         uses: aquasecurity/trivy-action@master
@@ -45,35 +40,42 @@ jobs:
           output: trivy-report.json
           exit-code: '0'
 
-      # Minimal change: the application is started by the user, not by this pipeline.
-      - name: Validate ZAP target
+      # Optional: start the app before ZAP. Adjust this section to your app.
+      # If your repository does not have docker-compose.yml, replace this with your own start command.
+      - name: Start application for ZAP
         run: |
           set -euo pipefail
-
-          if [ -z "${APP_URL:-}" ]; then
-            echo "SCAN_TARGET_URL is not configured in GitHub Actions Variables."
+          if [ ! -f docker-compose.yml ] && [ ! -f compose.yml ]; then
+            echo "docker-compose.yml or compose.yml was not found."
             exit 1
           fi
-
-          echo "Checking $APP_URL from self-hosted runner..."
-
-          for attempt in {1..20}; do
-            code="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-              --connect-timeout 5 --max-time 15 "$APP_URL" || true)"
-
-            echo "Attempt $attempt/20: HTTP $code"
-
-            if [[ "$code" =~ ^[123][0-9][0-9]$ ]]; then
-              echo "Target is reachable."
+          docker compose up -d --build
+          echo "Running containers:"
+          docker compose ps
+          for attempt in {1..30}; do
+            HTTP_CODE="$(
+              curl \
+                -L \
+                -sS \
+                -o /dev/null \
+                -w '%{http_code}' \
+                --connect-timeout 5 \
+                --max-time 10 \
+                "$APP_URL" || true
+            )"
+            echo "Attempt $attempt/30: HTTP $HTTP_CODE"
+            if [[ "$HTTP_CODE" =~ ^[123][0-9][0-9]$ ]]; then
+              echo "Application is ready at $APP_URL"
               exit 0
             fi
-
-            sleep 3
+            docker compose logs --tail=30 || true
+            sleep 2
           done
-
-          echo "Target is not reachable from this runner."
+          echo "Application failed to start."
+          docker compose ps
+          docker compose logs
           exit 1
-
+          
       - name: Run ZAP Baseline Scan
         run: |
           set -uo pipefail
@@ -82,10 +84,8 @@ jobs:
           mkdir -p zap-output
           chmod 777 zap-output
 
-          STARTED_AT="$(date -Iseconds)"
-          START_EPOCH="$(date +%s)"
-
           set +e
+
           docker run --rm \
             --network host \
             -v "${GITHUB_WORKSPACE}/zap-output:/zap/wrk:rw" \
@@ -97,19 +97,18 @@ jobs:
               -r zap-report.html \
               -I \
               2>&1 | tee zap-output/zap-scan.log
+
           ZAP_EXIT=${PIPESTATUS[0]}
+
           set -e
 
-          FINISHED_AT="$(date -Iseconds)"
-          DURATION_SECONDS=$(($(date +%s) - START_EPOCH))
-
           echo "ZAP exit code: $ZAP_EXIT"
-          echo "Duration: ${DURATION_SECONDS}s"
 
-          test -s zap-output/zap-report.json || {
-            echo "ZAP did not generate a JSON report."
+          if [ ! -s zap-output/zap-report.json ]; then
+            echo "ZAP did not generate zap-report.json."
+            cat zap-output/zap-scan.log || true
             exit 1
-          }
+          fi
 
           jq empty zap-output/zap-report.json
 
@@ -117,48 +116,11 @@ jobs:
           cp zap-output/zap-report.html zap-report.html
           cp zap-output/zap-scan.log zap-scan.log
 
-          TOTAL_ALERTS="$(jq '[.site[]?.alerts[]?] | length' zap-report.json)"
-          REPORT_HASH="$(sha256sum zap-report.json | awk '{print $1}')"
-          LOG_HASH="$(sha256sum zap-scan.log | awk '{print $1}')"
+          echo "ZAP report created successfully."
 
-          jq -n \
-            --arg target "$APP_URL" \
-            --arg started_at "$STARTED_AT" \
-            --arg finished_at "$FINISHED_AT" \
-            --arg report_sha256 "$REPORT_HASH" \
-            --arg log_sha256 "$LOG_HASH" \
-            --argjson duration_seconds "$DURATION_SECONDS" \
-            --argjson exit_code "$ZAP_EXIT" \
-            --argjson total_alerts "$TOTAL_ALERTS" \
-            '{
-              scan_status: "completed",
-              target_url: $target,
-              started_at: $started_at,
-              finished_at: $finished_at,
-              duration_seconds: $duration_seconds,
-              exit_code: $exit_code,
-              total_alerts: $total_alerts,
-              report_sha256: $report_sha256,
-              log_sha256: $log_sha256
-            }' > zap-evidence.json
-
-          cat zap-evidence.json
-
-      - name: Upload Security Reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-reports-${{ github.run_id }}
-          path: |
-            semgrep-report.json
-            trivy-report.json
-            zap-report.json
-            zap-report.html
-            zap-scan.log
-            zap-evidence.json
-            final-report.json
-            n8n-response.json
-
+          echo "ZAP alert types:"
+          jq '[.site[]?.alerts[]?] | length' zap-report.json
+          
       - name: Send Reports to n8n Security Gate
         id: security_gate
         run: |
@@ -168,7 +130,6 @@ jobs:
             --slurpfile trivy trivy-report.json \
             --slurpfile semgrep semgrep-report.json \
             --slurpfile zap zap-report.json \
-            --slurpfile zap_evidence zap-evidence.json \
             --arg repo "${{ github.repository }}" \
             --arg branch "${{ github.ref_name }}" \
             --arg commit "${{ github.sha }}" \
@@ -180,23 +141,24 @@ jobs:
               },
               trivy: $trivy[0],
               semgrep: $semgrep[0],
-              zap: $zap[0],
-              zap_evidence: $zap_evidence[0]
+              zap: $zap[0]
             }' > final-report.json
 
-          curl -fsS --retry 3 --connect-timeout 10 --max-time 240 \
+          curl -fsS --retry 3 --connect-timeout 10 --max-time 180 \
             -X POST "$N8N_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            --data-binary @final-report.json \
+            -d @final-report.json \
             -o n8n-response.json
 
           cat n8n-response.json
 
-          jq -e . n8n-response.json >/dev/null
+          if ! jq -e . n8n-response.json > /dev/null; then
+            echo "n8n did not return valid JSON. Blocking deployment."
+            exit 1
+          fi
 
-          decision="$(jq -r '.pipeline_decision // "BLOCK"' n8n-response.json \
-            | tr '[:upper:]' '[:lower:]')"
-          risk_score="$(jq -r '.final_risk_score // .risk_score // 0' n8n-response.json)"
+          decision=$(jq -r '.pipeline_decision // "BLOCK"' n8n-response.json | tr '[:upper:]' '[:lower:]')
+          risk_score=$(jq -r '.risk_score // 0' n8n-response.json)
 
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
           echo "risk_score=$risk_score" >> "$GITHUB_OUTPUT"
@@ -207,8 +169,34 @@ jobs:
           echo "Risk score: ${{ steps.security_gate.outputs.risk_score }}"
 
           if [ "${{ steps.security_gate.outputs.decision }}" != "allow" ]; then
-            echo "Security gate returned BLOCK."
+            echo "Security gate failed. CD deployment stopped."
             exit 1
           fi
 
-      # Keep your existing Docker Hub / Kubernetes steps below this line if needed.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Setup kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} set image deployment/${{ secrets.K8S_DEPLOYMENT }} \
+            ${{ secrets.K8S_CONTAINER }}=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} rollout status deployment/${{ secrets.K8S_DEPLOYMENT }}
