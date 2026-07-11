@@ -10,6 +10,8 @@ env:
   N8N_WEBHOOK_URL: https://unfitted-unsubtle-overdrive.ngrok-free.dev/webhook/security-scan
 
 jobs:
+  security-scan:
+    runs-on: [self-hosted, linux, zap]
   build-scan-gate-deploy:
     runs-on: ubuntu-latest
 
@@ -42,56 +44,75 @@ jobs:
 
       # Optional: start the app before ZAP. Adjust this section to your app.
       # If your repository does not have docker-compose.yml, replace this with your own start command.
-      - name: Start app for ZAP scan
+      - name: Validate ZAP target
         run: |
-          if [ -f docker-compose.yml ]; then
-            docker compose up -d --build
-          elif [ -f devsecops-demo-app/docker-compose.yml ]; then
-            docker compose -f devsecops-demo-app/docker-compose.yml up -d --build
-          else
-            echo "No docker-compose.yml found. Skipping app start."
+          set -euo pipefail
+
+          if [ -z "${SCAN_TARGET_URL:-}" ]; then
+            echo "SCAN_TARGET_URL is not configured."
+            exit 1
           fi
 
-          echo "Waiting for app at $APP_URL ..."
-          for i in {1..5}; do
-            if curl -sSf "$APP_URL" > /dev/null; then
-              echo "App is running at $APP_URL"
+         echo "Checking target: $SCAN_TARGET_URL"
+
+         for attempt in {1..20}; do
+            if curl -fsS --max-time 10 "$SCAN_TARGET_URL" >/dev/null; then
+              echo "Target is reachable."
+              curl -I --max-time 10 "$SCAN_TARGET_URL" || true
               exit 0
             fi
-            sleep 5
+
+            echo "Attempt $attempt/20 failed."
+            sleep 3
           done
 
-          echo "App is not reachable. ZAP report will be empty."
-          echo '{}' > zap-report.json
+          echo "Target is not reachable from the runner."
+          exit 1
 
       - name: Run ZAP Baseline Scan
         run: |
-          if [ -s zap-report.json ]; then
-            echo "Using existing empty ZAP report because app was not reachable."
-            exit 0
-          fi
+          set -euo pipefail
 
+          rm -rf zap-output
           mkdir -p zap-output
           chmod 777 zap-output
-          docker run --rm --network host \
-            -v ${{ github.workspace }}/zap-output:/zap/wrk:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
+
+          START_TIME=$(date +%s)
+
+          set +e
+          docker run --rm \
+            --network host \
+            -v "${{ github.workspace }}/zap-output:/zap/wrk:rw" \
+            -t ghcr.io/zaproxy/zaproxy:stable \
             zap-baseline.py \
-            -t "$APP_URL" \
-            -J zap-report.json \
-            -I || true
+              -t "$SCAN_TARGET_URL" \
+              -m 1 \
+              -J zap-report.json \
+              -r zap-report.html \
+              -I \
+              -d \
+              2>&1 | tee zap-output/zap-scan.log
 
-          cp zap-output/zap-report.json zap-report.json || echo '{}' > zap-report.json
+          ZAP_EXIT=${PIPESTATUS[0]}
+          set -e
 
-      - name: Upload Security Reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-reports
-          path: |
-            semgrep-report.json
-            trivy-report.json
-            zap-report.json
+          END_TIME=$(date +%s)
+          ZAP_DURATION=$((END_TIME - START_TIME))
 
+          echo "ZAP exit code: $ZAP_EXIT"
+          echo "ZAP duration: ${ZAP_DURATION}s"
+
+          test -s zap-output/zap-report.json || {
+            echo "ZAP report was not generated."
+            exit 1
+          }
+
+          cp zap-output/zap-report.json zap-report.json
+          cp zap-output/zap-report.html zap-report.html
+          cp zap-output/zap-scan.log zap-scan.log
+
+          jq empty zap-report.json
+          
       - name: Send Reports to n8n Security Gate
         id: security_gate
         run: |
