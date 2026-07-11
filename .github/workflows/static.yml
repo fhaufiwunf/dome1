@@ -1,42 +1,214 @@
-# Simple workflow for deploying static content to GitHub Pages
-name: Deploy static content to Pages
+name: DevSecOps Pipeline
 
 on:
-  # Runs on pushes targeting the default branch
   push:
     branches: ["main"]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
-
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# Allow one concurrent deployment
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+env:
+  IMAGE_NAME: devsecops-demo-app
+  # Set this variable in GitHub:
+  # Settings -> Secrets and variables -> Actions -> Variables
+  APP_URL: ${{ vars.SCAN_TARGET_URL }}
+  N8N_WEBHOOK_URL: https://unfitted-unsubtle-overdrive.ngrok-free.dev/webhook/security-scan
 
 jobs:
-  # Single deploy job since we're just deploying
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+  build-scan-gate-deploy:
+    # The job must run on the Ubuntu machine that can reach localhost/private targets.
+    runs-on: [self-hosted, linux, zap]
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Setup Pages
-        uses: actions/configure-pages@v3
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v1
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep Scan
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install semgrep
+          semgrep scan \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --json \
+            --output semgrep-report.json \
+            . || true
+          test -s semgrep-report.json
+          jq empty semgrep-report.json
+
+      - name: Run Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
         with:
-          # Upload entire repository
-          path: '.'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v1
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          ignore-unfixed: true
+          format: json
+          output: trivy-report.json
+          exit-code: '0'
+
+      # Minimal change: the application is started by the user, not by this pipeline.
+      - name: Validate ZAP target
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_URL:-}" ]; then
+            echo "SCAN_TARGET_URL is not configured in GitHub Actions Variables."
+            exit 1
+          fi
+
+          echo "Checking $APP_URL from self-hosted runner..."
+
+          for attempt in {1..20}; do
+            code="$(curl -L -sS -o /dev/null -w '%{http_code}' \
+              --connect-timeout 5 --max-time 15 "$APP_URL" || true)"
+
+            echo "Attempt $attempt/20: HTTP $code"
+
+            if [[ "$code" =~ ^[123][0-9][0-9]$ ]]; then
+              echo "Target is reachable."
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "Target is not reachable from this runner."
+          exit 1
+
+      - name: Run ZAP Baseline Scan
+        run: |
+          set -uo pipefail
+
+          rm -rf zap-output
+          mkdir -p zap-output
+          chmod 777 zap-output
+
+          STARTED_AT="$(date -Iseconds)"
+          START_EPOCH="$(date +%s)"
+
+          set +e
+          docker run --rm \
+            --network host \
+            -v "${GITHUB_WORKSPACE}/zap-output:/zap/wrk:rw" \
+            -t ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "$APP_URL" \
+              -m 1 \
+              -J zap-report.json \
+              -r zap-report.html \
+              -I \
+              2>&1 | tee zap-output/zap-scan.log
+          ZAP_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          FINISHED_AT="$(date -Iseconds)"
+          DURATION_SECONDS=$(($(date +%s) - START_EPOCH))
+
+          echo "ZAP exit code: $ZAP_EXIT"
+          echo "Duration: ${DURATION_SECONDS}s"
+
+          test -s zap-output/zap-report.json || {
+            echo "ZAP did not generate a JSON report."
+            exit 1
+          }
+
+          jq empty zap-output/zap-report.json
+
+          cp zap-output/zap-report.json zap-report.json
+          cp zap-output/zap-report.html zap-report.html
+          cp zap-output/zap-scan.log zap-scan.log
+
+          TOTAL_ALERTS="$(jq '[.site[]?.alerts[]?] | length' zap-report.json)"
+          REPORT_HASH="$(sha256sum zap-report.json | awk '{print $1}')"
+          LOG_HASH="$(sha256sum zap-scan.log | awk '{print $1}')"
+
+          jq -n \
+            --arg target "$APP_URL" \
+            --arg started_at "$STARTED_AT" \
+            --arg finished_at "$FINISHED_AT" \
+            --arg report_sha256 "$REPORT_HASH" \
+            --arg log_sha256 "$LOG_HASH" \
+            --argjson duration_seconds "$DURATION_SECONDS" \
+            --argjson exit_code "$ZAP_EXIT" \
+            --argjson total_alerts "$TOTAL_ALERTS" \
+            '{
+              scan_status: "completed",
+              target_url: $target,
+              started_at: $started_at,
+              finished_at: $finished_at,
+              duration_seconds: $duration_seconds,
+              exit_code: $exit_code,
+              total_alerts: $total_alerts,
+              report_sha256: $report_sha256,
+              log_sha256: $log_sha256
+            }' > zap-evidence.json
+
+          cat zap-evidence.json
+
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: |
+            semgrep-report.json
+            trivy-report.json
+            zap-report.json
+            zap-report.html
+            zap-scan.log
+            zap-evidence.json
+            final-report.json
+            n8n-response.json
+
+      - name: Send Reports to n8n Security Gate
+        id: security_gate
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --slurpfile trivy trivy-report.json \
+            --slurpfile semgrep semgrep-report.json \
+            --slurpfile zap zap-report.json \
+            --slurpfile zap_evidence zap-evidence.json \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit "${{ github.sha }}" \
+            '{
+              metadata: {
+                repo: $repo,
+                branch: $branch,
+                commit: $commit
+              },
+              trivy: $trivy[0],
+              semgrep: $semgrep[0],
+              zap: $zap[0],
+              zap_evidence: $zap_evidence[0]
+            }' > final-report.json
+
+          curl -fsS --retry 3 --connect-timeout 10 --max-time 240 \
+            -X POST "$N8N_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary @final-report.json \
+            -o n8n-response.json
+
+          cat n8n-response.json
+
+          jq -e . n8n-response.json >/dev/null
+
+          decision="$(jq -r '.pipeline_decision // "BLOCK"' n8n-response.json \
+            | tr '[:upper:]' '[:lower:]')"
+          risk_score="$(jq -r '.final_risk_score // .risk_score // 0' n8n-response.json)"
+
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "risk_score=$risk_score" >> "$GITHUB_OUTPUT"
+
+      - name: Check Security Gate
+        run: |
+          echo "Security decision: ${{ steps.security_gate.outputs.decision }}"
+          echo "Risk score: ${{ steps.security_gate.outputs.risk_score }}"
+
+          if [ "${{ steps.security_gate.outputs.decision }}" != "allow" ]; then
+            echo "Security gate returned BLOCK."
+            exit 1
+          fi
+
+      # Keep your existing Docker Hub / Kubernetes steps below this line if needed.
