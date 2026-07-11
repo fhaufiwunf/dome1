@@ -14,7 +14,7 @@ env:
 jobs:
   build-scan-gate-deploy:
     # The job must run on the Ubuntu machine that can reach localhost/private targets.
-    runs-on: [self-hosted, linux, zap]
+    runs-on: [self-hosted, linux, x86]
 
     steps:
       - name: Checkout code
