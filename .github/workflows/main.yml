@@ -6,7 +6,7 @@ on:
 
 env:
   IMAGE_NAME: devsecops-demo-app
-  APP_URL: http://127.0.0.1:4280
+  APP_URL: http://127.0.0.1:8081
   N8N_WEBHOOK_URL: https://unfitted-unsubtle-overdrive.ngrok-free.dev/webhook/security-scan
 
 jobs:
