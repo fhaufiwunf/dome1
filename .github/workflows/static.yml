@@ -120,7 +120,16 @@ jobs:
 
           echo "ZAP alert types:"
           jq '[.site[]?.alerts[]?] | length' zap-report.json
-          
+
+      - name: Upload Security Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            semgrep-report.json
+            trivy-report.json
+            zap-report.json
+            
       - name: Send Reports to n8n Security Gate
         id: security_gate
         run: |
